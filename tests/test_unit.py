@@ -154,6 +154,16 @@ class Install(unittest.TestCase):
         self.assertTrue(self.merge(f))
         self.assertEqual(set(json.loads(read(f))["hooks"]), {"SessionStart", "SessionEnd"})
 
+    def test_unrestored_snapshot_only_before_this_boot(self):
+        f = os.path.join(self.d, "snapshot.json")
+        write(f, "{}")
+        self.assertFalse(cp.unrestored_snapshot(f, ["false"]))          # written this boot: current, not unrestored
+        old = cp.boot_time() - 3600
+        os.utime(f, (old, old))
+        self.assertTrue(cp.unrestored_snapshot(f, ["false"]))           # from before boot, restore unit not active
+        self.assertFalse(cp.unrestored_snapshot(f, ["true"]))           # restore unit active this boot
+        self.assertFalse(cp.unrestored_snapshot(os.path.join(self.d, "none.json"), ["false"]))
+
     def test_units(self):
         cp.write_units(self.d, "/opt/cp")
         snap = read(os.path.join(self.d, "claude-persist-snapshot.service"))

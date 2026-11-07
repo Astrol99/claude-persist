@@ -32,8 +32,9 @@ LOCK, LOG, HOOKLOG, PIDS = (os.path.join(STATE, f) for f in ("restore.lock", "cl
 WEBHOOK = os.environ.get("CLAUDE_PERSIST_WEBHOOK_FILE") or os.path.join(HOME, ".config/claude-persist/discord-webhook")
 # Exists once restore has run since this user manager started (XDG_RUNTIME_DIR is emptied when it stops). Until then a
 # snapshot must not replace the last one, which is what the restore will read.
+MARKER_NAME = "claude-persist.restored"
 MARKER = os.environ.get("CLAUDE_PERSIST_MARKER") or os.path.join(
-    os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "claude-persist.restored")
+    os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", MARKER_NAME)
 TMUX = ["tmux", *(["-L", SOCKET] if SOCKET else [])]
 PANE_FMT = "#{session_id}\t#{window_index}\t#{pane_id}\t#{pane_pid}"
 ENABLED = ("claude-persist-restore.service", "claude-persist-snapshot.timer")
@@ -97,11 +98,31 @@ def state_lock(tries=1):
 
 
 def touch_marker(path=None, owner=None):
+    """Create the restore marker; False (and logged) when the runtime dir is missing, e.g. no systemd user session."""
     path = path or MARKER
-    with open(path, "a"):
-        pass
-    if owner:
-        os.chown(path, owner.pw_uid, owner.pw_gid)
+    try:
+        with open(path, "a"):
+            pass
+        if owner:
+            os.chown(path, owner.pw_uid, owner.pw_gid)
+    except OSError as e:
+        log(f"cannot create {path} ({e}); snapshots stay paused until it exists")
+        return False
+    return True
+
+
+def shutting_down():
+    """True while the system or this user manager is stopping: tmux may already be gone, and an empty snapshot then
+    would replace the one the next boot restores."""
+    for scope in ([], ["--user"]):
+        try:
+            r = subprocess.run(["systemctl", *scope, "is-system-running"], capture_output=True, text=True,
+                               timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.stdout.strip() == "stopping":
+            return True
+    return False
 
 
 def proc_stat(pid):
@@ -174,7 +195,7 @@ def claude_in_pane(pane_pid):
 
 
 def hook_record(pid):
-    """What the SessionStart/End hook recorded for this exact process (pid + start time), or None."""
+    """What the SessionStart/End hook recorded for this exact process (pid + start time), or {}."""
     rec = load_json(os.path.join(PIDS, f"{pid}.json")) or {}
     return rec if rec.get("start") == start_ticks(pid) else {}
 
@@ -258,8 +279,8 @@ def take_snapshot():
                      "#{@claude_persist_pane_command}"])
     r = tmux("list-panes", "-a", "-F", fmt)
     gone = ("no server running", "error connecting", "server exited unexpectedly")      # the last: mid-shutdown
-    if r.returncode != 0 and not any(g in r.stderr for g in gone):
-        return None                                     # tmux failed for some other reason: keep the last snapshot
+    if r.returncode != 0 and (not any(g in r.stderr for g in gone) or shutting_down()):
+        return None                                     # tmux failed otherwise, or is going down with the machine
     sessions = []                                       # tmux lists sessions, windows and panes in order
     for line in r.stdout.splitlines():
         sname, widx, wname, layout, wact, auto, pidx, ppid, pcwd, pact, was_cmd = line.split("\t")
@@ -405,11 +426,12 @@ def restore_plan(snap):
 
 def print_plan(snap, todo, live):
     print(f"snapshot taken {snap['taken_at']}: {len(snap['sessions'])} sessions")
+    names = {s["name"] for s in todo}
     for s in snap["sessions"]:
-        if s not in todo:
+        if s["name"] not in names:
             print(f"  skip session {s['name']}: already exists")
     for s, w, p in iter_panes(snap):
-        if s in todo:
+        if s["name"] in names:
             why, _ = pane_command(p, live)
             what = "shell" if not p["claude"] else f"SKIP ({why})" if why else claude_command(p["claude"])
             print(f"  {s['name']}:{w['index']}.{p['index']} [{w['name']}] {p['cwd']}: {what}")
@@ -490,8 +512,8 @@ def cmd_restore(dry):
         if not locked:
             print("a restore is already running")
             return 0
-        touch_marker()                                  # from now on snapshots may record the current state
         if not snap:
+            touch_marker()                              # nothing to keep: snapshots may record the current state
             print("no snapshot - nothing to restore")
             return 0
         todo, live = restore_plan(snap)                 # under the lock, so a finished restore's sessions count
@@ -512,6 +534,7 @@ def cmd_restore(dry):
                    + (f"; not resumed: {', '.join(problems)}" if problems else ""))
         log("restore: " + summary)
         print(summary)
+        touch_marker()                                  # only after a restore that ran through: snapshots resume
     if todo:
         icon = "\U0001F501" if not failed and not problems else "\u26a0\ufe0f"
         notify(f"{icon} {os.uname().nodename} ({os.environ.get('USER', '')}) after restart: {summary}. "
@@ -524,6 +547,9 @@ def cmd_status():
     if not snap:
         print("no snapshot yet")
         return 0
+    if not os.path.exists(MARKER):
+        print("NOTE: snapshots are paused until restore runs this boot (the restore unit needs lingering: "
+              "sudo loginctl enable-linger $USER). To resume now: claude-persist restore")
     n = sum(1 for _, _, p in iter_panes(snap) if p["claude"])
     checked = time.strftime("%F %T", time.localtime(os.path.getmtime(SNAP)))
     print(f"snapshot {snap['taken_at']} (checked {checked}) {snap['host']}/{snap['user']}: "
@@ -602,7 +628,7 @@ WantedBy=default.target
     "claude-persist-snapshot.service": """[Unit]
 Description=Snapshot tmux layout and Claude Code session ids for reboot recovery (claude-persist)
 After=claude-persist-restore.service
-ConditionPathExists=%t/claude-persist.restored
+ConditionPathExists=%t/{marker}
 
 [Service]
 Type=oneshot
@@ -628,7 +654,7 @@ def write_units(unit_dir, exe):
     os.makedirs(unit_dir, exist_ok=True)
     for name, text in UNITS.items():
         with open(os.path.join(unit_dir, name), "w") as f:
-            f.write(text.replace("{exe}", exe))
+            f.write(text.replace("{exe}", exe).replace("{marker}", MARKER_NAME))
 
 
 def merge_hooks(path, exe):
@@ -656,6 +682,22 @@ def run(*cmd):
     subprocess.run(list(cmd), check=True)
 
 
+def boot_time():
+    with open("/proc/stat") as f:
+        return next(int(line.split()[1]) for line in f if line.startswith("btime "))
+
+
+def unrestored_snapshot(snap, ctl):
+    """True when `snap` predates this boot and the restore unit has not run yet: install must not let a snapshot
+    replace it (re-running install after a reboot, before restore). A snapshot written during this boot (e.g. by an
+    older version being upgraded) is current, not unrestored."""
+    return (os.path.exists(snap) and os.path.getmtime(snap) < boot_time() and subprocess.run(
+        [*ctl, "is-active", "--quiet", "claude-persist-restore.service"], check=False).returncode != 0)
+
+
+PENDING_NOTE = "NOTE: the last snapshot has not been restored yet; snapshots resume after `claude-persist restore`"
+
+
 def cmd_install(args):
     """claude-persist install               this user: PATH link, hooks in settings.json, systemd user units, timer on
        claude-persist install --global USER   (root, e.g. in a dev container) copies itself to /usr/local/bin, units for
@@ -671,10 +713,16 @@ def cmd_install(args):
         except KeyError:
             print(f"no such user: {args[1]}", file=sys.stderr)
             return 2
-        if me != SYSTEM_EXE:                            # every user runs this file: it must be root-owned
-            shutil.copyfile(me, SYSTEM_EXE)
-        os.chown(SYSTEM_EXE, 0, 0)
-        os.chmod(SYSTEM_EXE, 0o755)
+        # every user runs this file: it must be root-owned. Copy then rename, so a symlink at SYSTEM_EXE is replaced
+        # (not written through) and a hook starting meanwhile never reads a half-written file.
+        target = me
+        if me != SYSTEM_EXE:
+            target = f"{SYSTEM_EXE}.tmp"
+            shutil.copyfile(me, target)
+        os.chown(target, 0, 0)
+        os.chmod(target, 0o755)
+        if target != SYSTEM_EXE:
+            os.replace(target, SYSTEM_EXE)
         write_units("/etc/systemd/user", SYSTEM_EXE)
         run("systemctl", "--global", "enable", *ENABLED)
         os.makedirs("/etc/claude-code", mode=0o755, exist_ok=True)
@@ -685,7 +733,12 @@ def cmd_install(args):
         run("systemctl", "start", f"user@{owner.pw_uid}.service")       # blocks until the user manager is ready
         uctl = ["systemctl", "--user", "-M", f"{owner.pw_name}@"]
         run(*uctl, "daemon-reload")
-        touch_marker(f"/run/user/{owner.pw_uid}/claude-persist.restored", owner)   # restore did not run this boot
+        marker = f"/run/user/{owner.pw_uid}/{MARKER_NAME}"
+        if not os.path.exists(marker):
+            if unrestored_snapshot(os.path.join(owner.pw_dir, ".local/state/claude-persist/snapshot.json"), uctl):
+                print(PENDING_NOTE)
+            else:
+                touch_marker(marker, owner)
         run(*uctl, "start", "claude-persist-snapshot.timer", "claude-persist-snapshot.service")
         run("su", "-", owner.pw_name, "-c", f"{SYSTEM_EXE} status | head -1")
         return 0
@@ -700,7 +753,11 @@ def cmd_install(args):
     write_units(os.path.join(HOME, ".config/systemd/user"), "%h/.local/bin/claude-persist")
     run("systemctl", "--user", "daemon-reload")
     run("systemctl", "--user", "enable", *ENABLED)    # restore runs at the next boot, not now
-    touch_marker()                                      # restore did not run this boot
+    if not os.path.exists(MARKER):
+        if unrestored_snapshot(SNAP, ["systemctl", "--user"]):
+            print(PENDING_NOTE)
+        elif not touch_marker():
+            print(f"NOTE: cannot create {MARKER}, so snapshots do not run (is there a systemd user session?)")
     run("systemctl", "--user", "start", "claude-persist-snapshot.timer")
     cmd_snapshot()
     linger = subprocess.run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger", "--value"],
