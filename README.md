@@ -30,7 +30,9 @@ conversation: same session id, same folder, same launch flags. Sessions ended de
   running conversation. Every pane is then checked against the expected session, and a summary can go to a Discord webhook.
 - **Flags:** an allow-list of launch flags is carried over (including multi-value ones such as `--add-dir a b`);
   anything else is dropped and shown by `claude-persist status`.
-- A snapshot never replaces a good one when the tmux server is missing or empty (the gap between boot and restore).
+- **Between boot and restore nothing is overwritten.** Restore writes a marker in `$XDG_RUNTIME_DIR` (emptied when the
+  user manager stops); snapshots only run once it exists. After that a snapshot records whatever is there, so closing
+  all your tmux sessions on purpose is remembered and a reboot does not bring them back.
 
 ## Use
 
@@ -40,7 +42,8 @@ claude-persist restore --dry-run    the plan, without doing anything
 claude-persist snapshot             take a snapshot now (the timer does this every 2 minutes)
 ```
 
-State and logs: `~/.local/state/claude-persist/` (`snapshot.json`, `snapshot.prev.json`, `pids/` hook records, `claude-persist.log`, `hooks.log`).
+State and logs: `~/.local/state/claude-persist/`: `snapshot.json`, `snapshot.prev.json` (the previous distinct state),
+`snapshot.pre-restore.json` (what the last restore started from), `pids/` (hook records), `claude-persist.log`, `hooks.log`.
 `CLAUDE_CONFIG_DIR` is honoured.
 
 ## Install
@@ -50,7 +53,10 @@ State and logs: `~/.local/state/claude-persist/` (`snapshot.json`, `snapshot.pre
 sudo claude-persist install --global me  # a machine/container: units for every user, hooks in managed settings, lingering for "me"
 ```
 
-- `install` on a host needs lingering for boot-time restore; it prints the command if it is off.
+- Boot-time restore needs lingering (`sudo loginctl enable-linger $USER`); `install` says so if it is off, and the
+  restore unit does not run without it (a restored tmux would otherwise die at logout).
+- `install --global` copies the script to a root-owned `/usr/local/bin/claude-persist` first, because every user's
+  hooks and units run that file.
 - **Incus dev containers (example for one particular setup):** `./provision-devbox.sh <name>...` or `--all` copies the script
   into containers named `dev-<name>` and runs `install --global <name>` inside each.
 - Optional Discord summary after each restore: put a webhook URL in `~/.config/claude-persist/discord-webhook`

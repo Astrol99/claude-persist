@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -14,24 +15,30 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout, redirect_stderr
 
 ROOT = tempfile.mkdtemp(prefix="cp-unit-")
 SOCK = f"cpunit-{os.getpid()}"
 os.environ.update(CLAUDE_PERSIST_STATE=f"{ROOT}/state", CLAUDE_CONFIG_DIR=f"{ROOT}/claude", CLAUDE_PERSIST_SOCKET=SOCK,
-                  CLAUDE_PERSIST_NOTIFY="0", CLAUDE_PERSIST_VERIFY_WAIT="1")
+                  CLAUDE_PERSIST_MARKER=f"{ROOT}/restored", CLAUDE_PERSIST_NOTIFY="0", CLAUDE_PERSIST_VERIFY_WAIT="1")
 _loader = importlib.machinery.SourceFileLoader("cp", os.path.join(os.path.dirname(__file__), "..", "claude-persist"))
 cp = importlib.util.module_from_spec(importlib.util.spec_from_loader("cp", _loader))
 _loader.exec_module(cp)
 
 
-def fake_claude(*args):
-    """Start a process whose argv is .../claude -c '...' <args>, like an interactive Claude Code with those flags."""
+def fake_claude_cmd(session_id=None, *args):
+    """Command line of a stand-in Claude: bash run under the name `claude`, ignoring its arguments, optionally calling
+    the real SessionStart hook for itself first (as Claude Code would)."""
     d = os.path.join(ROOT, "bin")
     os.makedirs(d, exist_ok=True)
     if not os.path.exists(f"{d}/claude"):
         os.symlink(shutil.which("bash"), f"{d}/claude")
-    p = subprocess.Popen([f"{d}/claude", "-c", "sleep 300; :", *args], start_new_session=True)
+    hook = (f"CLAUDE_PID=$$ {shlex.quote(sys.executable)} {shlex.quote(_loader.path)} hook start "
+            f"<<< {shlex.quote(json.dumps({'session_id': session_id}))}; " if session_id else "")
+    return [f"{d}/claude", "-c", f"{hook}sleep 300; :", *args]
+
+
+def fake_claude(*args):
+    p = subprocess.Popen(fake_claude_cmd(None, *args), start_new_session=True)
     time.sleep(0.1)
     return p
 
@@ -47,10 +54,17 @@ def reset_state():
     shutil.rmtree(cp.CLAUDE_DIR, ignore_errors=True)
     os.makedirs(cp.PIDS)
     os.makedirs(os.path.join(cp.CLAUDE_DIR, "sessions"))
+    cp.touch_marker()                                   # as if restore already ran this boot
 
 
-def tmux(*a):
-    return subprocess.run(["tmux", "-L", SOCK, *a], capture_output=True, text=True, check=False)
+tmux = cp.tmux                                          # the module already targets the test socket
+
+
+def captured(fn, *a):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        fn(*a)
+    return out.getvalue()
 
 
 def read(path):
@@ -71,7 +85,7 @@ class Parsing(unittest.TestCase):
         for argv in (["claude", "-p", "hi"], ["claude", "--print"], ["claude", "daemon", "run"], ["claude", "mcp"],
                      ["bash"], [], ["node", "server.js"]):
             self.assertIsNone(cp.claude_args(argv), argv)
-        self.assertEqual(cp.claude_argv(["claude", "-p", "x"]), ["-p", "x"])     # any Claude, used by the hook walk
+        self.assertEqual(cp.any_claude_args(["claude", "-p", "x"]), ["-p", "x"])  # any Claude, used by the hook walk
 
     def test_flags(self):
         kept, dropped = cp.carried_flags(["--dangerously-skip-permissions", "--resume", "abc", "--model", "opus",
@@ -116,7 +130,7 @@ class Install(unittest.TestCase):
         self.d = tempfile.mkdtemp(dir=ROOT)
 
     def merge(self, path):
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return cp.merge_hooks(path, "X")
 
     def test_merge_refuses_unparseable(self):
@@ -187,7 +201,7 @@ class Hook(unittest.TestCase):
 
     def test_pid_reuse_guard(self):
         cp.write_json(os.path.join(cp.PIDS, f"{self.proc.pid}.json"), {"session_id": "OLD", "start": "1", "ended": False})
-        self.assertIsNone(cp.hook_record(self.proc.pid))
+        self.assertEqual(cp.hook_record(self.proc.pid), {})
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
@@ -195,12 +209,9 @@ class SnapshotRestore(unittest.TestCase):
     def setUp(self):
         reset_state()
         tmux("kill-server")
-        self.procs = []
 
     def tearDown(self):
         tmux("kill-server")
-        for p in self.procs:
-            stop(p)
 
     def build(self):
         d = tempfile.mkdtemp(dir=ROOT)
@@ -210,61 +221,68 @@ class SnapshotRestore(unittest.TestCase):
         return d
 
     def snapshot(self):
-        with redirect_stdout(io.StringIO()):
-            cp.cmd_snapshot()
+        captured(cp.cmd_snapshot)
         return cp.load_json(cp.SNAP)
 
-    def test_snapshot_records_hook_session_and_skips_deliberate_exit(self):
+    def pane(self, index):
+        return next(p["claude"] for _, w, p in cp.iter_panes(self.snapshot()) if w["index"] == index)
+
+    def wait_record(self, target):
+        for _ in range(50):
+            cpid, _sid, source = cp.pane_session(cp.pane_pid_of(target))
+            if source == "hook":
+                return cpid
+            time.sleep(0.1)
+        raise self.failureException(f"no hook record for the stand-in Claude in {target}")
+
+    def test_finds_claude_in_panes_both_ways(self):
+        """No mocking: the stand-in runs inside real panes and calls the real hook."""
         self.build()
-        claude = fake_claude("--model", "opus")
-        self.procs.append(claude)
-        tmux("new-window", "-d", "-t", "u1:5", "-n", "cl", "exec sleep 300")    # placeholder pane we swap claude into
-        pane_pid = int(tmux("display-message", "-p", "-t", "u1:5", "#{pane_pid}").stdout)
-        cp.write_json(os.path.join(cp.PIDS, f"{claude.pid}.json"), {"session_id": "S9", "start": cp.start_ticks(claude.pid), "ended": False})
-        orig = cp.claude_in_pane
-        cp.claude_in_pane = lambda pid: claude.pid if pid == pane_pid else orig(pid)
-        try:
-            c = next(p["claude"] for _, w, p in cp.iter_panes(self.snapshot()) if w["index"] == 5)
-            self.assertEqual((c["session_id"], c["id_source"], c["flags"]), ("S9", "hook", ["--model", "opus"]))
-            cp.write_json(os.path.join(cp.PIDS, f"{claude.pid}.json"), {"session_id": "S9", "start": cp.start_ticks(claude.pid), "ended": True})
-            self.assertIsNone(next(p["claude"] for _, w, p in cp.iter_panes(self.snapshot()) if w["index"] == 5))
-        finally:
-            cp.claude_in_pane = orig
+        tmux("new-window", "-d", "-t", "u1:5", "-n", "typed", "bash --norc --noprofile -i")
+        tmux("send-keys", "-t", "u1:5", shlex.join(fake_claude_cmd("S5", "--model", "opus")), "Enter")
+        tmux("new-window", "-d", "-t", "u1:6", "-n", "cmd", shlex.join(fake_claude_cmd("S6")))
+        typed = self.wait_record("u1:5")
+        self.wait_record("u1:6")
+        c5, c6 = self.pane(5), self.pane(6)
+        self.assertEqual((c5["session_id"], c5["id_source"], c5["flags"], c5["pane_command"]), ("S5", "hook", ["--model", "opus"], False))
+        self.assertEqual((c6["session_id"], c6["pane_command"]), ("S6", True))
+        subprocess.run([sys.executable, _loader.path, "hook", "end"], input='{"reason": "prompt_input_exit"}', text=True,
+                       env=dict(os.environ, CLAUDE_PID=str(typed)), check=True)
+        self.assertIsNone(self.pane(5))                 # a deliberate /exit is not brought back
 
     def test_roundtrip_windows_layout_and_guards(self):
         d = self.build()
-        layout = tmux("display-message", "-p", "-t", "u1:2", "#{window_layout}").stdout.strip()
+        layout = tmux("display-message", "-p", "-t", "u1:2", "#{window_layout}").stdout
         snap = self.snapshot()
         self.assertEqual([w["index"] for w in snap["sessions"][0]["windows"]], [0, 2])
         mtime = os.path.getmtime(cp.SNAP)
         time.sleep(1.1)
         self.snapshot()
-        self.assertFalse(os.path.exists(cp.PREV))           # unchanged: not rewritten, no rotation
+        self.assertFalse(os.path.exists(cp.PREV))       # unchanged: not rewritten, no rotation
         self.assertGreater(os.path.getmtime(cp.SNAP), mtime)
         tmux("kill-server")
-        self.snapshot()                                     # no server: the good snapshot stays
+        os.remove(cp.MARKER)
+        self.snapshot()                                 # restore has not run this boot: the snapshot is kept
         self.assertEqual(cp.load_json(cp.SNAP)["sessions"][0]["name"], "u1")
         # a recorded Claude pane with no saved conversation is reported and comes back as a shell
         snap["sessions"][0]["windows"][0]["panes"][0]["claude"] = {"session_id": "GONE", "id_source": "hook", "flags": [],
                                                                   "dropped_flags": [], "pane_command": False}
         cp.write_json(cp.SNAP, snap)
-        out = io.StringIO()
-        with redirect_stdout(out):
-            cp.cmd_restore(False)
-        self.assertIn("restored 1 tmux session(s); Claude resumed 0/0", out.getvalue())
-        self.assertIn("(no saved conversation)", out.getvalue())
-        self.assertEqual(tmux("list-windows", "-t", "u1", "-F", "#{window_index}:#{window_name}").stdout.split(), ["0:" + snap["sessions"][0]["windows"][0]["name"], "2:split"])
+        out = captured(cp.cmd_restore, False)
+        self.assertTrue(os.path.exists(cp.MARKER))      # restore enables snapshots for this boot
+        self.assertIn("restored 1 tmux session(s); Claude resumed 0/0", out)
+        self.assertIn("(no saved conversation)", out)
+        self.assertEqual(tmux("list-windows", "-t", "u1", "-F", "#{window_index}:#{window_name}").stdout.split(),
+                         [f"{w['index']}:{w['name']}" for w in snap["sessions"][0]["windows"]])
         self.assertEqual(geometry(layout), geometry(tmux("display-message", "-p", "-t", "u1:2", "#{window_layout}").stdout))
         self.assertEqual(tmux("display-message", "-p", "-t", "u1:0", "#{pane_current_path}").stdout.strip(), d)
-        out = io.StringIO()
-        with redirect_stdout(out):
-            cp.cmd_restore(True)
-        self.assertIn("skip session u1: already exists", out.getvalue())
+        self.assertIn("skip session u1: already exists", captured(cp.cmd_restore, True))
+        tmux("kill-server")
+        self.assertEqual(self.snapshot()["sessions"], [])   # after restore, closing everything is remembered
 
 
 def geometry(layout):
     """A tmux layout string without its checksum and pane ids: the sizes and positions only."""
-    import re  # noqa: PLC0415
     return re.sub(r",\d+([},\]]|$)", r"\1", layout.strip().split(",", 1)[1])
 
 

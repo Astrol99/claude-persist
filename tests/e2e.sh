@@ -9,7 +9,7 @@
 set -uo pipefail
 CP="$(cd "$(dirname "$0")/.." && pwd)/claude-persist"
 W=$(mktemp -d /tmp/cp-e2e.XXXXXX); S="tmux -L cptest"
-export CLAUDE_PERSIST_SOCKET=cptest CLAUDE_PERSIST_STATE="$W/state" CLAUDE_PERSIST_NOTIFY=0 CLAUDE_PERSIST_VERIFY_WAIT=60
+export CLAUDE_PERSIST_SOCKET=cptest CLAUDE_PERSIST_STATE="$W/state" CLAUDE_PERSIST_MARKER="$W/restored" CLAUDE_PERSIST_NOTIFY=0 CLAUDE_PERSIST_VERIFY_WAIT=60
 pass=0; fail=0
 ok()  { echo "  PASS $*"; pass=$((pass+1)); }
 bad() { echo "  FAIL $*"; fail=$((fail+1)); }
@@ -29,8 +29,8 @@ wait_claude() {  # wait until the pane's Claude reached SessionStart (past any t
     [ "$(src_of "$1")" = hook ] && return 0; sleep 1
   done; return 1
 }
-mkdir -p "$W/alpha" "$W/beta" "$W/state/pids"
-A=$(python3 -c 'import uuid;print(uuid.uuid4())'); B=$(python3 -c 'import uuid;print(uuid.uuid4())')
+mkdir -p "$W/alpha" "$W/beta" "$W/state/pids"; touch "$W/restored"   # as if restore already ran this boot
+A=$(cat /proc/sys/kernel/random/uuid); B=$(cat /proc/sys/kernel/random/uuid)
 (cd "$W/alpha" && env -u TMUX -u TMUX_PANE claude -p --model haiku --session-id "$A" "Reply with exactly: ok" </dev/null >/dev/null)
 (cd "$W/beta"  && env -u TMUX -u TMUX_PANE claude -p --model haiku --session-id "$B" "Reply with exactly: ok" </dev/null >/dev/null)
 $S kill-server 2>/dev/null
@@ -42,7 +42,7 @@ P_A=$($S display-message -p -t t1:0 '#{pane_id}'); P_B=$($S display-message -p -
 check "both test sessions running (trust prompts answered)" 'wait_claude "$P_A" && wait_claude "$P_B"'
 check "hook recorded the right session per process" '[ "$("$CP" _pane-session "$P_A")" = "$A hook" ] && [ "$("$CP" _pane-session "$P_B")" = "$B hook" ]'
 "$CP" snapshot
-layout_before=$(python3 -c "import json;d=json.load(open('$W/state/snapshot.json'));print([w for s in d['sessions'] for w in s['windows'] if w['index']==3][0]['layout'])")
+layout_before=$($S display-message -p -t t1:3 '#{window_layout}')
 $S kill-server; sleep 4
 check "no claude left after the 'reboot'" '! pgrep -u "$USER" -f -- "--resume ($A|$B)" >/dev/null'
 out=$("$CP" restore); echo "  restore: $out"
