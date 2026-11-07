@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# The checks are eval'd strings, so to shellcheck their variables look unused and their $(...) unexpanded:
+# shellcheck disable=SC2016,SC2034
 # End-to-end test without a reboot. Uses a SEPARATE tmux server (-L cptest) and two throwaway conversations created
 # with two tiny `claude -p --model haiku` calls in scratch folders (deleted afterwards). Never touches real sessions.
 # Covers: snapshot -> kill server ("reboot") -> restore; same session ids; window names/indices/cwd; two-pane layout
@@ -15,7 +17,7 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 cleanup() {
   $S kill-server 2>/dev/null
   for _ in $(seq 1 20); do pgrep -u "$USER" -f -- "--resume (${A:-x}|${B:-x})" >/dev/null || break; sleep 0.5; done   # let dying Claudes finish
-  for sid in ${A:-} ${B:-}; do d=$(dirname "$(ls ~/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -1)"); case "$d" in *cp-e2e*) rm -rf "$d";; esac; done
+  for sid in ${A:-} ${B:-}; do for t in ~/.claude/projects/*/"$sid".jsonl; do case "$t" in *cp-e2e*) rm -rf "$(dirname "$t")";; esac; done; done
   rm -rf "$W"
 }
 trap cleanup EXIT

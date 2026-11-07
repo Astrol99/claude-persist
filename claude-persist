@@ -14,11 +14,22 @@ How it works (README.md has the reasons):
   * A systemd user timer snapshots every 2 minutes; nothing is saved at shutdown (the user manager gets 5s).
   * Restore runs once at boot: it creates only missing sessions and starts each pane with
     `$SHELL -lic 'cd <dir> && claude <flags> --resume <id>; exec $SHELL -l'`, so nothing is typed into a shell.
-Internal: _write-units <dir> <exe>, _merge-hooks <settings.json> <exe>, _pane-session <pane>, _answer-trust <pane>.
+  claude-persist install [--global USER]  set up hooks, systemd units and the timer (see cmd_install)
+Internal (tests): _pane-session <pane>, _answer-trust <pane>.
 Optional: a Discord webhook URL in ~/.config/claude-persist/discord-webhook (or CLAUDE_PERSIST_WEBHOOK_FILE) for a summary after each restore.
 Test knobs: CLAUDE_PERSIST_SOCKET=<tmux -L name>  CLAUDE_PERSIST_STATE=<dir>  CLAUDE_PERSIST_NOTIFY=0  CLAUDE_PERSIST_VERIFY_WAIT=<s>
 """
-import fcntl, glob, json, os, pwd, shlex, shutil, subprocess, sys, time
+import contextlib
+import fcntl
+import glob
+import json
+import os
+import pwd
+import shlex
+import shutil
+import subprocess
+import sys
+import time
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -48,8 +59,8 @@ def log(msg, path=LOG):
 
 
 def tmux(*args, timeout=10):
-    return subprocess.run(["tmux"] + (["-L", SOCKET] if SOCKET else []) + list(args),
-                          capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(["tmux", *(["-L", SOCKET] if SOCKET else []), *args],
+                          capture_output=True, text=True, timeout=timeout, check=False)
 
 
 def load_json(path):
@@ -124,7 +135,7 @@ def claude_in_pane(pane_pid):
     """The interactive Claude in a pane: the terminal's foreground process first, then a search of the pane's own
     descendants (no scan of every process on the machine)."""
     st = proc_stat(pane_pid)
-    queue = ([int(st[5])] if st and st[5].isdigit() and int(st[5]) > 0 else []) + [pane_pid]
+    queue = [*([int(st[5])] if st and st[5].isdigit() and int(st[5]) > 0 else []), pane_pid]
     seen = set()
     while queue:
         pid = queue.pop(0)
@@ -162,6 +173,10 @@ def pane_session(pane_pid):
     """(claude_pid, session_id) for a pane, or (None, None)."""
     cpid = claude_in_pane(pane_pid)
     return (cpid, session_of(cpid)[0]) if cpid else (None, None)
+
+
+def pane_pid_of(target):
+    return int(tmux("display-message", "-p", "-t", target, "#{pane_pid}").stdout)
 
 
 def transcript_exists(sid):
@@ -241,10 +256,8 @@ def take_snapshot():
         if cpid:
             sid, source, ended = session_of(cpid)
             if not ended:                               # a deliberate /exit in progress: do not bring it back
-                try:
+                with contextlib.suppress(OSError):
                     pane["cwd"] = claude_pid_file(cpid).get("cwd") or os.readlink(f"/proc/{cpid}/cwd")
-                except OSError:
-                    pass
                 kept, dropped = carried_flags(claude_args(cmdline(cpid)) or [])
                 pane["claude"] = {"session_id": sid, "id_source": source, "flags": kept, "dropped_flags": dropped,
                                   "pane_command": int(ppid) == cpid or was_cmd == "1"}
@@ -256,10 +269,8 @@ def take_snapshot():
 def prune_hook_records():
     for f in glob.glob(os.path.join(PIDS, "*.json")):
         if hook_record(os.path.basename(f)[:-5]) is None:             # process gone, or pid reused
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(f)
-            except OSError:
-                pass
 
 
 def cmd_snapshot():
@@ -274,8 +285,7 @@ def cmd_snapshot():
         if snap is None:
             return 0
         old = load_json(SNAP)
-        strip = lambda d: {k: v for k, v in d.items() if k != "taken_at"}
-        if old and strip(old) == strip(snap):
+        if old and {**old, "taken_at": None} == {**snap, "taken_at": None}:
             os.utime(SNAP)                              # unchanged: no rewrite
             return 0
         if old:
@@ -322,10 +332,10 @@ def answer_trust_prompt(pane_pid, pane_id):
     cpid = claude_in_pane(pane_pid)
     if not cpid or hook_record(cpid):
         return False
-    tail = [l for l in tmux("capture-pane", "-p", "-t", pane_id).stdout.splitlines() if l.strip()][-12:]
-    if not any("Yes, I trust this folder" in l for l in tail) or not any("Enter to confirm" in l for l in tail):
+    tail = [line for line in tmux("capture-pane", "-p", "-t", pane_id).stdout.splitlines() if line.strip()][-12:]
+    if not any("Yes, I trust this folder" in line for line in tail) or not any("Enter to confirm" in line for line in tail):
         return False
-    if any("No, exit" in l and "❯" in l for l in tail):
+    if any("No, exit" in line and "\u276f" in line for line in tail):    # \u276f: the dialog's cursor glyph
         tmux("send-keys", "-t", pane_id, "Down")
         time.sleep(0.4)
     tmux("send-keys", "-t", pane_id, "Enter")
@@ -335,7 +345,7 @@ def answer_trust_prompt(pane_pid, pane_id):
 def notify(text):
     if os.environ.get("CLAUDE_PERSIST_NOTIFY") == "0" or not os.path.isfile(WEBHOOK):
         return
-    import urllib.request                               # imported here: costs ~16ms, only used once per boot
+    import urllib.request  # noqa: PLC0415 -- imported here: ~16ms, used once per boot
     body = json.dumps({"content": text[:1900], "username": "claude-persist", "allowed_mentions": {"parse": []}}).encode()
     for attempt in range(6):                            # the network may not be up yet right after boot
         try:
@@ -357,15 +367,99 @@ def notify(text):
 def create_session(s, w, size, tail):
     """Create the session with its first window. A brand-new tmux server goes into its own systemd scope so it does
     not live inside the restore service; falls back to plain tmux where systemd-run is unavailable."""
-    args = ["new-session", "-d", "-P", "-F", "#{session_id}\t#{window_index}\t#{pane_id}\t#{pane_pid}",
+    args = ["new-session", "-d", "-P", "-F", PANE_FMT,
             "-s", s["name"], "-n", w["name"], "-x", size[0], "-y", size[1], "-c", w["panes"][0]["cwd"], *tail]
     if tmux("list-sessions").returncode != 0 and shutil.which("systemd-run"):
         r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect",
                             f"--unit=tmux-server-{os.getpid()}-{int(time.time())}",
-                            "tmux"] + (["-L", SOCKET] if SOCKET else []) + args, capture_output=True, text=True)
+                            "tmux", *(["-L", SOCKET] if SOCKET else []), *args], capture_output=True, text=True, check=False)
         if r.returncode == 0:
             return r
     return tmux(*args)
+
+
+PANE_FMT = "#{session_id}\t#{window_index}\t#{pane_id}\t#{pane_pid}"
+
+
+def restore_plan(snap):
+    """(existing session names, sessions to create, live session ids)."""
+    existing = set(tmux("list-sessions", "-F", "#{session_name}").stdout.splitlines())
+    return existing, [s for s in snap["sessions"] if s["name"] not in existing], live_session_ids()
+
+
+def print_plan(snap, existing, todo, live):
+    print(f"snapshot taken {snap['taken_at']}: {len(snap['sessions'])} sessions")
+    for s in snap["sessions"]:
+        if s["name"] in existing:
+            print(f"  skip session {s['name']}: already exists")
+    for s, w, p in iter_panes({"sessions": todo}):
+        why, _ = pane_command(p, live)
+        what = "shell" if not p["claude"] else f"SKIP ({why})" if why else claude_command(p["claude"])
+        print(f"  {s['name']}:{w['index']}.{p['index']} [{w['name']}] {p['cwd']}: {what}")
+
+
+def create_window(s, w, sess, live, problems):
+    """Create window w with its panes (and session s itself when sess is None).
+    Returns (session id or None if the session could not be created, [(pane, pane_id, pane_pid, runs_claude)])."""
+    label, created = f"{s['name']}:{w['index']} {w['name']}", []
+    for i, p in enumerate(w["panes"]):
+        why, tail = pane_command(p, live)
+        if why:
+            problems.append(f"{label} ({why})")
+        if i == 0 and sess is None:
+            width, _, height = (w["layout"].split(",")[1] if "," in w["layout"] else "200x50").partition("x")
+            what, out = "session", create_session(s, w, (width, height or "50"), tail)
+        elif i == 0:
+            what, out = "window", tmux("new-window", "-d", "-P", "-F", PANE_FMT, "-t", f"{sess}:{w['index']}",
+                                       "-n", w["name"], "-c", p["cwd"], *tail)
+        else:
+            what, out = "pane", tmux("split-window", "-d", "-P", "-F", PANE_FMT, "-t", created[-1][1], "-c", p["cwd"], *tail)
+        if out.returncode:
+            problems.append(f"{label}: could not create {what} ({out.stderr.strip()})")
+            break
+        new_sess, widx, pane_id, pane_pid = out.stdout.strip().split("\t")
+        if sess is None:
+            sess = new_sess
+            if int(widx) != w["index"]:                 # the first window gets base-index; move it to its old index
+                tmux("move-window", "-s", f"{sess}:{widx}", "-t", f"{sess}:{w['index']}")
+        created.append((p, pane_id, int(pane_pid), bool(tail)))
+    return sess, created
+
+
+def finish_window(sess, s, w, created, expected):
+    """Restore naming, layout, selection; register panes that should come up running Claude."""
+    target, label = f"{sess}:{w['index']}", f"{s['name']}:{w['index']} {w['name']}"
+    if w.get("automatic_rename") in (True, None, "on"):                # name came from the pane title: keep it automatic
+        tmux("set-option", "-w", "-u", "-t", target, "automatic-rename")
+    if len(created) > 1:
+        tmux("select-layout", "-t", target, w["layout"])
+    for p, pane_id, pane_pid, runs in created:
+        if runs:
+            expected[pane_id] = (pane_pid, p["claude"]["session_id"], label)
+            if p["claude"]["pane_command"]:             # remember it across the wrapper shell for the next reboot
+                tmux("set-option", "-p", "-t", pane_id, "@claude_persist_pane_command", "1")
+        if p["active"]:
+            tmux("select-pane", "-t", pane_id)
+    if w["active"]:
+        tmux("select-window", "-t", target)
+
+
+def verify(expected):
+    """Poll until each pane runs Claude with the expected session, answering folder-trust prompts. Returns failures."""
+    deadline = time.time() + float(os.environ.get("CLAUDE_PERSIST_VERIFY_WAIT", "60"))
+    pending = dict(expected)
+    while pending and time.time() < deadline:
+        time.sleep(2)
+        for pane_id, (pane_pid, want, label) in list(pending.items()):
+            if pane_session(pane_pid)[1] == want:
+                del pending[pane_id]
+            elif answer_trust_prompt(pane_pid, pane_id):
+                log(f"restore: answered folder-trust prompt in {label}")
+    failed = []
+    for pane_pid, _want, label in pending.values():
+        cpid, got = pane_session(pane_pid)
+        failed.append(f"{label} ({'not running' if not cpid else 'different session ' + str(got)[:8]})")
+    return failed
 
 
 def cmd_restore(dry):
@@ -373,19 +467,8 @@ def cmd_restore(dry):
     if not snap:
         print("no snapshot - nothing to restore")
         return 0
-    def plan():
-        existing = set(tmux("list-sessions", "-F", "#{session_name}").stdout.splitlines())
-        return existing, [s for s in snap["sessions"] if s["name"] not in existing], live_session_ids()
     if dry:
-        existing, todo, live = plan()
-        print(f"snapshot taken {snap['taken_at']}: {len(snap['sessions'])} sessions")
-        for s in snap["sessions"]:
-            if s["name"] in existing:
-                print(f"  skip session {s['name']}: already exists")
-        for s, w, p in iter_panes({"sessions": todo}):
-            why, _ = pane_command(p, live)
-            what = "shell" if not p["claude"] else f"SKIP ({why})" if why else claude_command(p["claude"])
-            print(f"  {s['name']}:{w['index']}.{p['index']} [{w['name']}] {p['cwd']}: {what}")
+        print_plan(snap, *restore_plan(snap))
         return 0
     os.makedirs(PIDS, exist_ok=True)
     with open(LOCK, "a") as lk:
@@ -398,81 +481,25 @@ def cmd_restore(dry):
         else:
             print("a restore is already running")
             return 0
-        existing, todo, live = plan()                   # under the lock, so a finished restore's sessions count
+        _, todo, live = restore_plan(snap)              # under the lock, so a finished restore's sessions count
         shutil.copyfile(SNAP, PRE_RESTORE)
         expected, problems = {}, []                     # expected: pane_id -> (pane_pid, session_id, label)
         for s in todo:
-            target_sess = None
+            sess = None
             for w in s["windows"]:
-                label = f"{s['name']}:{w['index']} {w['name']}"
-                created = []                            # (pane, pane_id, pane_pid, will_run_claude)
-                for i, p in enumerate(w["panes"]):
-                    why, tail = pane_command(p, live)
-                    if why:
-                        problems.append(f"{label} ({why})")
-                    if i == 0 and target_sess is None:
-                        size = (w["layout"].split(",")[1] if "," in w["layout"] else "200x50").split("x") + ["50"]
-                        out = create_session(s, w, size[:2], tail)
-                        if out.returncode:
-                            problems.append(f"{s['name']}: could not create session ({out.stderr.strip()})")
-                            break
-                        target_sess, base_idx, pid_, ppid = out.stdout.strip().split("\t")
-                        if int(base_idx) != w["index"]:
-                            tmux("move-window", "-s", f"{target_sess}:{base_idx}", "-t", f"{target_sess}:{w['index']}")
-                    elif i == 0:
-                        out = tmux("new-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t",
-                                   f"{target_sess}:{w['index']}", "-n", w["name"], "-c", p["cwd"], *tail)
-                        if out.returncode:
-                            problems.append(f"{label}: could not create window ({out.stderr.strip()})")
-                            break
-                        pid_, ppid = out.stdout.strip().split("\t")
-                    else:
-                        out = tmux("split-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", created[-1][1],
-                                   "-c", p["cwd"], *tail)
-                        if out.returncode:
-                            problems.append(f"{label}: could not split pane ({out.stderr.strip()})")
-                            break
-                        pid_, ppid = out.stdout.strip().split("\t")
-                    created.append((p, pid_, int(ppid), bool(tail)))
-                if target_sess is None:                 # the session could not be created: skip the rest of it
+                sess, created = create_window(s, w, sess, live, problems)
+                if sess is None:                        # the session could not be created: skip the rest of it
                     break
-                if not created:
-                    continue
-                target = f"{target_sess}:{w['index']}"
-                if w.get("automatic_rename") in (True, None, "on"):        # name came from the pane title: keep it automatic
-                    tmux("set-option", "-w", "-u", "-t", target, "automatic-rename")
-                if len(created) > 1:
-                    tmux("select-layout", "-t", target, w["layout"])
-                for p, pid_, ppid, runs in created:
-                    if runs and p["claude"]["pane_command"]:    # remember it across the wrapper shell for the next reboot
-                        tmux("set-option", "-p", "-t", pid_, "@claude_persist_pane_command", "1")
-                    if runs:
-                        expected[pid_] = (ppid, p["claude"]["session_id"], label)
-                    if p["active"]:
-                        tmux("select-pane", "-t", pid_)
-                if w["active"]:
-                    tmux("select-window", "-t", target)
-        # verify: poll until each pane runs Claude with the expected session, answering folder-trust prompts
-        deadline = time.time() + float(os.environ.get("CLAUDE_PERSIST_VERIFY_WAIT", "60"))
-        pending = dict(expected)
-        while pending and time.time() < deadline:
-            time.sleep(2)
-            for pane_id, (ppid, want, label) in list(pending.items()):
-                if pane_session(ppid)[1] == want:
-                    del pending[pane_id]
-                elif answer_trust_prompt(ppid, pane_id):
-                    log(f"restore: answered folder-trust prompt in {label}")
-        failed = []
-        for pane_id, (ppid, want, label) in pending.items():
-            cpid, got = pane_session(ppid)
-            failed.append(f"{label} ({'not running' if not cpid else 'different session ' + str(got)[:8]})")
-        summary = (f"restored {len(todo)} tmux session(s); Claude resumed {len(expected) - len(pending)}/{len(expected)}"
+                if created:
+                    finish_window(sess, s, w, created, expected)
+        failed = verify(expected)
+        summary = (f"restored {len(todo)} tmux session(s); Claude resumed {len(expected) - len(failed)}/{len(expected)}"
                    + (f"; FAILED: {', '.join(failed)}" if failed else "")
                    + (f"; not resumed: {', '.join(problems)}" if problems else ""))
         log("restore: " + summary)
         print(summary)
     if todo:
-        icon = "🔁" if not failed and not problems else "⚠️"
+        icon = "\U0001F501" if not failed and not problems else "\u26a0\ufe0f"
         notify(f"{icon} {os.uname().nodename} ({os.environ.get('USER', '')}) after restart: {summary}. "
                f"For any missed: `claude --resume` in that folder.")
     return 0
@@ -540,7 +567,7 @@ def cmd_hook(kind):
     return 0
 
 
-# ---------------------------------------------------------------- install helpers (used by install-host.sh / provision-devbox.sh)
+# ---------------------------------------------------------------- install
 UNITS = {
     "claude-persist-restore.service": """[Unit]
 Description=Restore tmux sessions and resume Claude Code conversations after boot (claude-persist)
@@ -580,22 +607,19 @@ WantedBy=timers.target
 }
 
 
-def cmd_write_units(unit_dir, exe):
+def write_units(unit_dir, exe):
     os.makedirs(unit_dir, exist_ok=True)
     for name, text in UNITS.items():
         with open(os.path.join(unit_dir, name), "w") as f:
             f.write(text.replace("{exe}", exe))
-    print(f"units written to {unit_dir}")
-    return 0
 
 
-def cmd_merge_hooks(path, exe):
-    data = {}
-    if os.path.exists(path) and os.path.getsize(path):
-        data = load_json(path)
-        if not isinstance(data, dict):                  # never replace a settings file we cannot read
-            print(f"{path}: unreadable or not a JSON object, not changed", file=sys.stderr)
-            return 1
+def merge_hooks(path, exe):
+    """Add our SessionStart/SessionEnd hooks next to existing ones. Never rewrites a file it cannot parse."""
+    data = load_json(path) if os.path.exists(path) and os.path.getsize(path) else {}
+    if not isinstance(data, dict):
+        print(f"{path}: unreadable or not a JSON object, not changed", file=sys.stderr)
+        return False
     changed = False
     for ev, arg in (("SessionStart", "start"), ("SessionEnd", "end")):
         cmd = f"{exe} hook {arg}"
@@ -608,21 +632,66 @@ def cmd_merge_hooks(path, exe):
             shutil.copyfile(path, f"{path}.bak-claude-persist-{time.strftime('%Y%m%d-%H%M%S')}")
         write_json(path, data)
     print(f"{path}: hooks {'added' if changed else 'already present'}")
-    return 0
+    return True
 
 
-def pane_pid_of(target):
-    return int(tmux("display-message", "-p", "-t", target, "#{pane_pid}").stdout)
+def run(*cmd):
+    subprocess.run(list(cmd), check=True)
+
+
+def cmd_install(args):
+    """claude-persist install               this user: PATH link, hooks in settings.json, systemd user units, timer on
+       claude-persist install --global USER   (root, e.g. inside a dev container) units for every user, hooks in
+                                              /etc/claude-code/managed-settings.json, lingering + timer for USER"""
+    me = os.path.realpath(__file__)
+    if args[:1] == ["--global"]:
+        if len(args) < 2 or os.geteuid() != 0:
+            print("usage (as root): claude-persist install --global <user>", file=sys.stderr)
+            return 2
+        user = args[1]
+        write_units("/etc/systemd/user", me)
+        run("systemctl", "--global", "enable", *[u for u in UNITS if not u.endswith("snapshot.service")])
+        os.makedirs("/etc/claude-code", mode=0o755, exist_ok=True)
+        if not merge_hooks("/etc/claude-code/managed-settings.json", me):
+            return 1
+        os.chmod("/etc/claude-code/managed-settings.json", 0o644)
+        run("loginctl", "enable-linger", user)
+        for _ in range(20):                             # the user manager starts asynchronously after enable-linger
+            if subprocess.run(["systemctl", "--user", "-M", f"{user}@", "is-system-running"], capture_output=True, check=False).returncode in (0, 1):
+                break
+            time.sleep(0.5)
+        run("systemctl", "--user", "-M", f"{user}@", "daemon-reload")
+        run("systemctl", "--user", "-M", f"{user}@", "start", "claude-persist-snapshot.timer")
+        run("su", "-", user, "-c", f"{shlex.quote(me)} snapshot && {shlex.quote(me)} status | head -1")
+        return 0
+    link = os.path.join(HOME, ".local/bin/claude-persist")
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    if os.path.realpath(link) != me:
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(me, link)
+    if not merge_hooks(os.path.join(CLAUDE_DIR, "settings.json"), "$HOME/.local/bin/claude-persist"):
+        return 1
+    write_units(os.path.join(HOME, ".config/systemd/user"), "%h/.local/bin/claude-persist")
+    run("systemctl", "--user", "daemon-reload")
+    run("systemctl", "--user", "enable", "claude-persist-restore.service")    # runs at next boot, not now
+    run("systemctl", "--user", "enable", "--now", "claude-persist-snapshot.timer")
+    cmd_snapshot()
+    linger = subprocess.run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger", "--value"],
+                            capture_output=True, text=True, check=False).stdout.strip()
+    if linger != "yes":
+        print("NOTE: lingering is off, so nothing runs at boot until you log in. Enable it:  sudo loginctl enable-linger $USER")
+    return cmd_status()
 
 
 def main(argv):
     cmds = {
-        "snapshot": lambda a: cmd_snapshot(),
+        "snapshot": lambda _a: cmd_snapshot(),
         "restore": lambda a: cmd_restore("--dry-run" in a),
-        "status": lambda a: cmd_status(),
+        "status": lambda _a: cmd_status(),
+        "install": cmd_install,
         "hook": lambda a: cmd_hook(a[0]) if a and a[0] in ("start", "end") else 2,
-        "_write-units": lambda a: cmd_write_units(a[0], a[1]),
-        "_merge-hooks": lambda a: cmd_merge_hooks(a[0], a[1]),
+        # internal, used by tests/e2e.sh
         "_pane-session": lambda a: print(" ".join(map(str, session_of(c)[:2])) if (c := claude_in_pane(pane_pid_of(a[0]))) else "") or 0,
         "_answer-trust": lambda a: print(answer_trust_prompt(pane_pid_of(a[0]), a[0])) or 0,
     }

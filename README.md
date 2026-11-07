@@ -45,18 +45,25 @@ State and logs: `~/.local/state/claude-persist/` (`snapshot.json`, `snapshot.pre
 
 ## Install
 
-- **This machine, current user:** `./install-host.sh` (PATH link, hooks in `~/.claude/settings.json`, user units; the
-  units and hook entries come from `claude-persist _write-units` / `_merge-hooks`).
-- **Incus dev containers (example for one particular setup):** `./provision-devbox.sh <name>...` or `--all` assumes
-  containers named `dev-<name>` with a user `<name>` inside; (binary in `/usr/local/bin`, units in
-  `/etc/systemd/user`, hooks in `/etc/claude-code/managed-settings.json`, lingering for the dev user).
+```
+./claude-persist install                 # this user: PATH link, hooks in ~/.claude/settings.json, systemd user units
+sudo claude-persist install --global me  # a machine/container: units for every user, hooks in managed settings, lingering for "me"
+```
+
+- `install` on a host needs lingering for boot-time restore; it prints the command if it is off.
+- **Incus dev containers (example for one particular setup):** `./provision-devbox.sh <name>...` or `--all` copies the script
+  into containers named `dev-<name>` and runs `install --global <name>` inside each.
 - Optional Discord summary after each restore: put a webhook URL in `~/.config/claude-persist/discord-webhook`
   (mode 600), or point `CLAUDE_PERSIST_WEBHOOK_FILE` at one.
 
 ## Test
 
-`tests/e2e.sh` runs a full snapshot, kill and restore cycle on a separate tmux server with two throwaway conversations
-(two tiny `claude -p --model haiku` calls). It never touches real sessions.
+- `python3 -m unittest discover -s tests` — fast (about 2s), no network and no real Claude: flag parsing, Claude
+  detection, skip decisions, the hook's records (with a stand-in Claude process), settings-file merging, and a
+  snapshot/restore round trip on a separate tmux server.
+- `tests/e2e.sh` — the real thing on a separate tmux server with two throwaway conversations (two or three tiny
+  `claude -p --model haiku` calls, about 40s): snapshot, kill, restore, trust prompt, `/exit`, nested `claude -p`.
+  It never touches real sessions.
 
 ## Limits
 
