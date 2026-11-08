@@ -37,6 +37,29 @@ def fake_claude_cmd(session_id=None, *args):
     return [f"{d}/claude", "-c", f"{hook}sleep 300; :", *args]
 
 
+def fake_trust_dialog_cmd(session_id):
+    """A stand-in Claude stopped at the folder-trust prompt, reproducing what made a boot restore pick "No, exit":
+    the dialog is drawn ~1s before keys are read, keys that arrive together are handled as one batch, and Enter
+    acts on the cursor as drawn before that batch (a Down in the same batch is too late). The cursor starts on "No"
+    and does not wrap. Choosing "Yes" calls the real SessionStart hook, as Claude Code would. It stays a process named claude (no exec)."""
+    cmd = fake_claude_cmd(session_id)
+    hook = cmd[2].removesuffix("sleep 300; :")
+    script = (
+        "stty -icanon -echo; cur=No\n"
+        "draw() { printf '\\033[H\\033[2J Accessing workspace:\\n /tmp\\n\\n'\n"
+        "  if [ $cur = No ]; then printf ' \u276f No, exit\\n   Yes, I trust this folder\\n'\n"
+        "  else printf '   No, exit\\n \u276f Yes, I trust this folder\\n'; fi\n"
+        "  printf ' Enter to confirm \u00b7 Esc to cancel\\n'; }\n"
+        "draw; sleep 1\n"
+        "while IFS= read -rsn1 c; do keys=${c:-ENTER}; start=$cur\n"
+        "  while IFS= read -rsn1 -t 0.05 c; do keys+=${c:-ENTER}; done\n"
+        "  case $keys in *B*) cur=Yes;; esac\n"                 # a Down arrow is ESC [ B
+        "  case $keys in *ENTER*) if [ $start = Yes ]; then " + hook + "sleep 300; exit; fi\n"
+        "    echo 'chose: No, exit'; sleep 300; exit 1;; esac\n"
+        "  draw; done\n")
+    return [cmd[0], "-c", script]
+
+
 def fake_claude(*args):
     p = subprocess.Popen(fake_claude_cmd(None, *args), start_new_session=True)
     time.sleep(0.1)
@@ -289,6 +312,66 @@ class SnapshotRestore(unittest.TestCase):
         self.assertIn("skip session u1: already exists", captured(cp.cmd_restore, True))
         tmux("kill-server")
         self.assertEqual(self.snapshot()["sessions"], [])   # after restore, closing everything is remembered
+
+
+class TrustPrompt(unittest.TestCase):
+    def setUp(self):
+        reset_state()
+        tmux("kill-server")
+
+    def tearDown(self):
+        tmux("kill-server")
+
+    def start(self, name, sid):
+        tmux("new-session", "-d", "-s", name, "-x", "60", "-y", "51", shlex.join(fake_trust_dialog_cmd(sid)))
+        for _ in range(50):
+            if "Enter to confirm" in tmux("capture-pane", "-p", "-t", name).stdout:
+                return cp.pane_pid_of(f"{name}:0")
+            time.sleep(0.05)
+        raise self.failureException("the stand-in never drew its dialog")
+
+    def test_stand_in_reproduces_the_boot_failure(self):
+        """Down and Enter sent together while Claude is not reading yet choose "No, exit" (the old answer)."""
+        self.start("old", "S0")
+        tmux("send-keys", "-t", "old", "Down")
+        tmux("send-keys", "-t", "old", "Enter")
+        time.sleep(1.5)
+        self.assertIn("chose: No, exit", tmux("capture-pane", "-p", "-t", "old").stdout)
+
+    def test_enter_only_after_the_screen_shows_yes(self):
+        pid = self.start("t", "ST")
+        keys = []
+        for _ in range(40):
+            if cp.pane_session(pid)[2] == "hook":
+                break
+            keys.append(cp.answer_trust_prompt(pid, "t:0"))
+            time.sleep(0.25)
+        self.assertEqual(cp.pane_session(pid)[1:], ("ST", "hook"), f"keys sent: {keys}")
+        sent = [k for k in keys if k]
+        self.assertEqual((sent[0], sent[-1], sent.count("Enter")), ("Down", "Enter", 1))
+        self.assertIsNone(cp.answer_trust_prompt(pid, "t:0"))   # past SessionStart: no more keys
+
+    def test_verify_wait_ignores_wall_clock_jumps(self):
+        """At boot NTP can move the clock back an hour; the wait must still end after CLAUDE_PERSIST_VERIFY_WAIT."""
+        fake = fake_claude()                            # a Claude that never reaches the expected session
+        clock = iter(range(10**6, 0, -3600))
+        old_time = cp.time.time
+        cp.time.time = lambda: next(clock)              # every call: an hour earlier than the last
+
+        def too_long(*_):
+            raise self.failureException("verify kept waiting while the wall clock went backwards")
+        old_alarm = signal.signal(signal.SIGALRM, too_long)
+        signal.alarm(10)
+        try:
+            t0 = time.monotonic()
+            failed = cp.verify({"%0": (fake.pid, "WANTED", "x:0")})
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_alarm)
+            cp.time.time = old_time
+            stop(fake)
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertEqual(len(failed), 1)
 
 
 def geometry(layout):

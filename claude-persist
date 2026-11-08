@@ -364,20 +364,23 @@ def pane_command(p, live):
 
 
 def answer_trust_prompt(pane_pid, pane_id):
-    """Claude stops at a folder-trust prompt whose default is "No, exit" (always for $HOME, whose trust Claude never
-    keeps). Answer "Yes" only while the pane's Claude has not reached SessionStart yet (the prompt comes first), so
-    keys are never sent into a running conversation, and only when the dialog is on the last lines of the screen."""
+    """Claude stops at a folder-trust prompt whose cursor starts on "No, exit" (always for $HOME, whose trust Claude
+    never keeps). Steer it to "Yes" one key per call, judged from the screen: Down while the cursor is on "No", Enter
+    only once the screen shows it on "Yes". Claude draws the dialog before it reads keys; keys sent early arrive
+    together and Enter acts on the old cursor, choosing "No, exit" (seen in a real boot, 2026-11-08). Only while
+    the pane's Claude has not reached SessionStart yet (the prompt comes first), so keys never go into a running
+    conversation, and only when the dialog is on the last lines of the screen. Returns the key sent, or None."""
     cpid = claude_in_pane(pane_pid)
     if not cpid or hook_record(cpid):
-        return False
+        return None
     tail = [line for line in tmux("capture-pane", "-p", "-t", pane_id).stdout.splitlines() if line.strip()][-12:]
-    if not any("Yes, I trust this folder" in line for line in tail) or not any("Enter to confirm" in line for line in tail):
-        return False
-    if any("No, exit" in line and "\u276f" in line for line in tail):    # \u276f: the dialog's cursor glyph
-        tmux("send-keys", "-t", pane_id, "Down")
-        time.sleep(0.4)
-    tmux("send-keys", "-t", pane_id, "Enter")
-    return True
+    if not any("Enter to confirm" in line for line in tail):
+        return None
+    cursor = next((line for line in tail if "\u276f" in line), "")    # \u276f: the dialog's cursor glyph
+    key = "Enter" if "Yes, I trust this folder" in cursor else "Down" if "No, exit" in cursor else None
+    if key:
+        tmux("send-keys", "-t", pane_id, key)
+    return key
 
 
 def notify(text):
@@ -484,14 +487,16 @@ def finish_window(sess, w, label, created, expected):
 
 def verify(expected):
     """Poll until each pane runs Claude with the expected session, answering folder-trust prompts. Returns failures."""
-    deadline = time.time() + float(os.environ.get("CLAUDE_PERSIST_VERIFY_WAIT", "60"))
+    # monotonic: at boot the wall clock can jump (NTP fixing an RTC kept in local time moved it back 1h in a real boot,
+    # 2026-11-08, which kept this loop running for an hour instead of a minute)
+    deadline = time.monotonic() + float(os.environ.get("CLAUDE_PERSIST_VERIFY_WAIT", "60"))
     pending = dict(expected)
-    while pending and time.time() < deadline:
+    while pending and time.monotonic() < deadline:
         time.sleep(1)
         for pane_id, (pane_pid, want, label) in list(pending.items()):
             if pane_session(pane_pid)[1] == want:
                 del pending[pane_id]
-            elif answer_trust_prompt(pane_pid, pane_id):
+            elif answer_trust_prompt(pane_pid, pane_id) == "Enter":
                 log(f"restore: answered folder-trust prompt in {label}")
     failed = []
     for pane_pid, _want, label in pending.values():

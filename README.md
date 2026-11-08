@@ -27,7 +27,9 @@ conversation: same session id, same folder, same launch flags. Sessions ended de
   nothing is typed into a shell (a pane that *was* Claude closes on a normal exit, as before). A new tmux server gets its
   own systemd scope, not the restore service. Claude's folder-trust prompt (default "No, exit"; always shown for `$HOME`,
   whose trust Claude never keeps) is answered only before that pane's Claude reaches SessionStart, so keys never go into a
-  running conversation. Every pane is then checked against the expected session, and a summary can go to a Discord webhook.
+  running conversation. It sends one key per check and reads the screen in between: Down while the cursor is on "No",
+  Enter only once the cursor is drawn on "Yes". Claude draws the dialog before it reads keys, and keys sent together then
+  arrive in one batch where Enter still sees the old cursor and picks "No, exit". Every pane is then checked against the expected session, and a summary can go to a Discord webhook.
 - **Flags:** an allow-list of launch flags is carried over (including multi-value ones such as `--add-dir a b`);
   anything else is dropped and shown by `claude-persist status`.
 - **Between boot and restore nothing is overwritten.** Restore writes a marker in `$XDG_RUNTIME_DIR` (emptied when the
@@ -64,9 +66,10 @@ sudo claude-persist install --global me  # a machine/container: units for every 
 
 ## Test
 
-- `python3 -m unittest discover -s tests` — fast (about 2s), no network and no real Claude: flag parsing, Claude
-  detection, skip decisions, the hook's records (with a stand-in Claude process), settings-file merging, and a
-  snapshot/restore round trip on a separate tmux server.
+- `python3 -m unittest discover -s tests` — fast (about 6s), no network and no real Claude: flag parsing, Claude
+  detection, skip decisions, the hook's records (with a stand-in Claude process), settings-file merging, a
+  snapshot/restore round trip on a separate tmux server, the trust-prompt answer against a stand-in dialog that reads
+  keys late, and the restore's wait surviving a wall-clock jump.
 - `tests/e2e.sh` — the real thing on a separate tmux server with two throwaway conversations (two or three tiny
   `claude -p --model haiku` calls, about 40s): snapshot, kill, restore, trust prompt, `/exit`, nested `claude -p`.
   It never touches real sessions.
